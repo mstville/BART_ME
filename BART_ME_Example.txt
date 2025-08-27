@@ -1,0 +1,332 @@
+#############################################################################################################
+# BART with Classical Measurement Error (BART-ME) Example: 2000 individuals and the following model.
+#
+# Outcome Model:
+#
+# Y = f(X) - 0.05*Z1 + Z2 + e, e~N(0,1),
+#
+# where Z1~Uniform(18,40), Z2~Bernoulli(0.5), 
+#
+# f(X) = 38 - 0.008(X1-60)^2 - 0.015(X2-20)^2 - 0.002(X3-70)^2,
+#
+# X=(X1, X2, X3)~N(mu_x, Sigma_x), mu_x=(65, 20, 75), and Sig_x defined to have
+# marginal variances (140, 12, 155) and pairwise correlations = 0.9.
+#
+# Classical Measurement Error Model: 
+#
+# 50% of sample has replicate measurements of error-prone observations of X:
+#
+# W_j = X + U_j, U_j~N(0, Sigma_u),
+#
+# where Sigma_u defined to have marginal error variances (10, 1, 12) and
+# correlations (-0.02, 0.02, 0.25).
+#############################################################################################################
+
+# Load necessary R packages
+library(mvtnorm)
+library(dbarts)
+library(MCMCpack)
+
+#############################################################
+
+n=2000              ## number of observations
+m=50                ## number of trees for BART fit
+G=4000              ## number of Gibbs iterates
+
+### Generate true (unobserved) exposures
+k=3                              ## number of exposure variables
+mux.t=c(65, 20, 75)              ## marginal means
+sig2x.t=c(140, 12, 155)          ## marginal variances
+delta=0.9                        ## pairwise correlations 
+Sigx.t=matrix(0,nrow=3,ncol=3)
+for (j in 1:3){
+  for (k in 1:3){
+    if (j==k){
+      Sigx.t[j,k]=sig2x.t[j]
+    } else {
+      Sigx.t[j,k]=delta*sqrt(sig2x.t[j])*sqrt(sig2x.t[k])
+    }
+  }
+}
+X.t=rmvnorm(n,mean=mux.t,sigma=Sigx.t) 
+
+### True underlying function relating X to outcome Y:
+f.t = 38 - 0.008 * (X.t[,1] - 60)^2 - 0.015 * (X.t[,2] - 20)^2 - 0.002 * (X.t[,3] - 70)^2 
+
+### Generate classical error-prone observed 
+### replicate measurements of true exposures
+sig2u.t=c(10, 1, 12)
+rhou.t=c(-0.02, 0.02, 0.25)
+Sigu.t=matrix(0,nrow=3,ncol=3)
+idu=1
+for (j in 1:3){
+  for (k in j:3){
+    if (j==k){
+      Sigu.t[j,k]=sig2u.t[j]
+    } else {
+      covjk=rhou.t[idu]*sqrt(sig2u.t[j])*sqrt(sig2u.t[k])
+      Sigu.t[j,k]=covjk
+      Sigu.t[k,j]=covjk
+      idu=idu+1
+    }
+  }
+}
+r=sample(1:3,n,replace=TRUE, prob=c(0.5,0.35,0.15))   ## 50% of sample have replicates
+W.l=lapply(1:n,function(i){
+  Wi=rmvnorm(r[i],X.t[i,],Sigu.t)
+  Wi
+})
+
+### Generate error-free covariates/confounders 
+p=2                        ## number of error-free covariates
+Z=cbind(runif(n,18,40),rbinom(n,1,0.5))
+beta.t=c(-0.05, 1)         ## model coefficients associated with Z
+
+### Generate outcome
+Y.t=as.vector(f.t+Z%*%beta.t+rnorm(n,0,1))
+
+#############################################################
+### Fit BART-ME Model with 50 trees
+
+### Initialize parameters
+beta=beta.t
+tau2.beta=10000
+
+V0.u=diag(k)
+m0.u=5
+Sig.u=Sigu.t
+
+mux=sapply(1:k,function(j){
+  wbar=rep(-99,n)
+  for (i in 1:n){
+    Wij=W.l[[i]][,j]
+    wbar[i]=mean(Wij)
+  }
+  mean(wbar)
+})
+tau2.mux=10000
+
+V0.x=diag(k)
+m0.x=5
+Sig.x=Sigx.t
+
+X.l=lapply(1:n,function(i){
+  Wi=W.l[[i]]
+  apply(Wi,2,mean)
+})
+X=matrix(unlist(X.l),ncol=k,byrow=TRUE)
+colnames(X)=paste0("X",1:k)
+
+### Save dataset for BART
+Ystar = Y.t - Z%*%beta
+Ystar = as.vector(Ystar)
+train=data.frame(cbind(Ystar,X))
+names(train)[1]="Y.t"
+
+### We only need to draw one sample at a time, so create a control object
+control <- dbartsControl(updateState = FALSE, verbose = FALSE, n.burn = 0L, 
+                         n.samples = 1L, n.thin = 1L, n.chains = 1L,n.trees = m)  #n.thin=20?
+
+### Create the sampler 
+sampler=dbarts(Y.t~.,train,control=control)
+
+### run first iteration of tree
+samples <- sampler$run()
+f=rowMeans(samples$train)
+sig2.e=samples$sigma**2
+
+### Saving devices
+f.mcmc=matrix(-99,nrow=G,ncol=n)
+var.mcmc=matrix(-99,nrow=G,ncol=k)
+Sig.u.mcmc=array(data=-99,c(k,k,G))
+Sig.x.mcmc=array(data=-99,c(k,k,G))
+mux.mcmc=matrix(-99,nrow=G,ncol=k)
+X.mcmc=array(data=-99,c(n,k,G))
+acc=rep(0,n)  ## for tracking MH acceptance rate of latent X
+
+### Variance for proposal distribution of X in MH step
+hx.l=lapply(1:n,function(i){
+  hx=rep(-99,k)
+  for (j in 1:k){
+    hx[j]=0.5*sd(X[,j])
+  }
+  hx
+})
+Hx.l=lapply(1:n,function(i){
+  diag(hx.l[[i]])
+})
+
+### For posterior updates that can be stored outside of Gibbs sampler
+mstar.u = m0.u + sum(r)
+mstar.x = m0.x + n
+ZtZ = t(Z)%*%Z
+
+##################################################
+###########################
+# GIBBS SAMPLER STARTS HERE
+for (g in 1:G){
+  
+  ###########################
+  ##### MH-STEP TO UPDATE X
+  Zb=as.vector(Z%*%beta)
+  
+  X.new.l=lapply(1:n,function(i){
+    Xi=X[i,]
+    Hxi=Hx.l[[i]]
+    Xi.new=rmvnorm(1,mean=as.vector(Xi),sigma=as.matrix(Hxi))
+    as.vector(Xi.new)
+  })
+  X.new=matrix(unlist(X.new.l),ncol=k,byrow=TRUE)
+  colnames(X.new)=paste0("X",1:k)
+  f.new=sampler$predict(X.new)
+  
+  log.ratio=sapply(1:n,function(i){
+    Yi=Y.t[i]
+    Wi=W.l[[i]]
+    
+    log_num = dnorm(Yi, f.new[i]+Zb[i], sqrt(sig2.e), log = TRUE) +
+      dmvnorm(X.new[i,], mean=mux, sigma=as.matrix(Sig.x), log=TRUE) +
+      sum(dmvnorm(Wi, mean = X.new[i,], sigma = Sig.u, log = TRUE))
+    
+    log_denom = dnorm(Yi, f[i]+Zb[i], sqrt(sig2.e), log = TRUE) +
+      dmvnorm(X[i,], mean=mux, sigma=as.matrix(Sig.x), log=TRUE) +
+      sum(dmvnorm(Wi, mean = X[i,], sigma = Sig.u, log = TRUE))
+    
+    log_num - log_denom
+  })
+  
+  u=runif(n)
+  exam=(log(u)<=log.ratio) & !is.na(log.ratio)
+  temp.l=lapply(1:n,function(i){
+    if (exam[i]==TRUE){
+      temp=X.new[i,]
+    } else {
+      temp=X[i,]
+    }
+    temp
+  })
+  
+  X=matrix(unlist(temp.l),ncol=k,byrow=TRUE)
+  acc=acc+exam
+  sampler$setPredictor(x = X, column=c(1:k), forceUpdate = TRUE)
+  
+  ##### Update trees
+  samples=sampler$run()
+  f=rowMeans(samples$train)
+  
+  ##### Update sig2.e
+  sig2.e=samples$sigma**2
+  
+  ##### Recover variable freq counts
+  count=samples$varcount
+  
+  ##### Update beta
+  Vb=solve((1/sig2.e)*ZtZ+(1/tau2.beta)*diag(p))
+  mb=Vb%*%((1/sig2.e)*t(Z)%*%(Y.t-f))
+  beta=as.vector(rmvnorm(1,mean=as.vector(mb),sigma=as.matrix(Vb)))
+  
+  ##### Recover predicted Y
+  Y = f + Z%*%beta + rnorm(n,0,sqrt(sig2.e))
+  Y = as.vector(Y)
+  
+  ##### Update response for BART
+  Ystar=Y.t-Z%*%beta
+  Ystar=as.vector(Ystar)
+  sampler$setResponse(Ystar)
+  
+  ##### Update Sig.u
+  S.u<-Reduce('+', lapply(1:n,function(i){
+    Xi=X[i,]
+    Wi=W.l[[i]]
+    Si=matrix(0,nrow=k,ncol=k)
+    for (j in 1:r[i]){
+      add=(Wi[j,]-Xi)%*%t(Wi[j,]-Xi)
+      Si=Si+add
+    }
+    Si
+  }))
+  Vstar.u=V0.u + S.u
+  Sig.u=riwish(mstar.u,Vstar.u)
+  
+  ##### Update Sig.x
+  S.x.l=lapply(1:n,function(i){
+    Xi=X[i,]
+    (Xi-mux)%*%t(Xi-mux)
+  })
+  S.x=Reduce('+',S.x.l)
+  S.x=(1/n)*S.x
+  Vstar.x=V0.x + n*S.x
+  Sig.x=riwish(mstar.x,Vstar.x)
+  
+  ##### Update mux
+  Sigi.x=solve(Sig.x)
+  Vx=solve(n*Sigi.x + (1/tau2.mux)*diag(k))
+  mx=Vx%*%Sigi.x%*%colSums(X)
+  mux=as.vector(rmvnorm(1,mean=as.vector(mx),sigma=as.matrix(Vx)))
+  
+  ##### Update random walk parameters
+  if (ceiling(g/100)==floor(g/100) & g <= 2000){
+    hx.l <- lapply(1:n,function(i){
+      hxi=hx.l[[i]]
+      for (j in 1:k){
+        hxi[j] <- ifelse(acc[i]>40, hxi[j] + 0.1*hxi[j],
+                         ifelse(acc[i]<20, hxi[j] - 0.1*hxi[j], hxi[j]))
+      }
+      hxi
+    })
+    Hx.l <- lapply(1:n,function(i){
+      hxi=hx.l[[i]]
+      Hxi=diag(hxi)
+      Hxi
+    })
+    acc=rep(0,n)
+  }
+  
+  
+  ##### Store
+  f.mcmc[g,]=f
+  var.mcmc[g,]=count
+  Sig.u.mcmc[,,g]=Sig.u
+  Sig.x.mcmc[,,g]=Sig.x
+  mux.mcmc[g,]=mux
+  X.mcmc[,,g]=X
+  
+  # print(g)
+  
+} 
+#### GIBBS SAMPLER ENDS HERE
+##############################
+
+#############################################################
+### Analyze model results using last half of MCMC chain
+burn=2001:G
+
+f=apply(f.mcmc[burn,],2,mean)                            ## posterior mean estimates of function 
+f.ci=apply(f.mcmc[burn,],2,quantile,probs=c(.025,.975))  ## 95% credible interval
+
+Sigu=apply(Sig.u.mcmc[,,burn],c(1,2),mean)               ## posterior mean estimates of measurement error covariance Sigma_u
+Sigu.sd=apply(Sig.u.mcmc[,,burn],c(1,2),sd)              ## posterior standard deviation estimates
+
+Sigx=apply(Sig.x.mcmc[,,burn],c(1,2),mean)               ## posterior mean estimates of exposure covariance Sigma_x
+Sigx.sd=apply(Sig.x.mcmc[,,burn],c(1,2),sd)              ## posterior standard deviation estimates
+
+mux=apply(mux.mcmc[burn,],2,mean)                        ## posterior mean estimates of exposure mean vector mu_x
+mux.sd=apply(mux.mcmc[burn,],2,sd)                       ## posterior standard deviation estimates 
+
+varcount = var.mcmc[burn,]
+percount = varcount/apply(varcount,1,sum)
+vip = apply(percount,2,mean)                             ## variable inclusion proportions (use smaller # of trees to analyze variable importance)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
